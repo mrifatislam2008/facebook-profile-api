@@ -1,50 +1,40 @@
+
 <?php
-// Facebook Profile Picture API for Vercel
+// Facebook Profile Picture API
+// File: api/index.php
+// Save as UTF-8 without BOM. Do not add anything before <?php.
 
 ini_set('display_errors', '0');
 ini_set('log_errors', '1');
-error_reporting(E_ALL);
 
-header('X-Content-Type-Options: nosniff');
+header('Cache-Control: no-store');
 
-function sendJsonError(int $status, string $message): void
+function sendError(int $status, string $message): void
 {
-    if (!headers_sent()) {
-        http_response_code($status);
-        header('Content-Type: application/json; charset=utf-8');
-        header('Cache-Control: no-store');
-    }
-
+    http_response_code($status);
+    header('Content-Type: application/json; charset=utf-8');
     echo json_encode([
         'success' => false,
         'error' => $message
-    ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    ], JSON_UNESCAPED_SLASHES);
     exit;
 }
 
-function makeRequest(string $url, array $options = []): array
+function requestUrl(string $url, array $options = []): array
 {
     $ch = curl_init($url);
-
-    if ($ch === false) {
-        return [
-            'body' => false,
-            'error' => 'curl_init failed',
-            'status' => 0,
-            'content_type' => ''
-        ];
-    }
 
     $defaults = [
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_CONNECTTIMEOUT => 10,
-        CURLOPT_TIMEOUT => 30,
+        CURLOPT_TIMEOUT => 25,
         CURLOPT_SSL_VERIFYPEER => true,
         CURLOPT_SSL_VERIFYHOST => 2,
-        CURLOPT_FOLLOWLOCATION => false,
-        CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
-        CURLOPT_USERAGENT =>
-            'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/131.0.0.0 Mobile Safari/537.36'
+        CURLOPT_HTTPHEADER => [
+            'Accept: */*',
+            'Accept-Encoding: identity',
+            'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36'
+        ],
     ];
 
     curl_setopt_array($ch, $options + $defaults);
@@ -54,7 +44,7 @@ function makeRequest(string $url, array $options = []): array
     $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
     $contentType = (string) curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
 
-    unset($ch);
+    curl_close($ch);
 
     return [
         'body' => $body,
@@ -64,36 +54,7 @@ function makeRequest(string $url, array $options = []): array
     ];
 }
 
-function isAllowedFacebookUrl(string $url): bool
-{
-    if (strlen($url) > 2048 ||
-        filter_var($url, FILTER_VALIDATE_URL) === false) {
-        return false;
-    }
-
-    $parts = parse_url($url);
-
-    if (!is_array($parts)) {
-        return false;
-    }
-
-    $scheme = strtolower($parts['scheme'] ?? '');
-    $host = strtolower($parts['host'] ?? '');
-
-    $allowedHosts = [
-        'facebook.com',
-        'www.facebook.com',
-        'm.facebook.com',
-        'web.facebook.com'
-    ];
-
-    return in_array($scheme, ['http', 'https'], true)
-        && in_array($host, $allowedHosts, true)
-        && !isset($parts['user'])
-        && !isset($parts['pass']);
-}
-
-function isPublicHttpsUrl(string $url): bool
+function isValidHttpsUrl(string $url): bool
 {
     if (filter_var($url, FILTER_VALIDATE_URL) === false) {
         return false;
@@ -101,182 +62,173 @@ function isPublicHttpsUrl(string $url): bool
 
     $parts = parse_url($url);
 
-    if (!is_array($parts) ||
+    if (
+        !is_array($parts) ||
         strtolower($parts['scheme'] ?? '') !== 'https' ||
         empty($parts['host']) ||
         isset($parts['user']) ||
-        isset($parts['pass'])) {
+        isset($parts['pass'])
+    ) {
         return false;
     }
 
     $host = strtolower($parts['host']);
 
-    if ($host === 'localhost' ||
+    if (
+        $host === 'localhost' ||
         str_ends_with($host, '.localhost') ||
-        str_ends_with($host, '.local')) {
+        str_ends_with($host, '.local')
+    ) {
         return false;
     }
 
-    // Reject literal private/reserved IP addresses.
-    if (filter_var($host, FILTER_VALIDATE_IP)) {
-        return filter_var(
-            $host,
+    $ip = filter_var($host, FILTER_VALIDATE_IP)
+        ? $host
+        : gethostbyname($host);
+
+    if (
+        filter_var($ip, FILTER_VALIDATE_IP) === false ||
+        filter_var(
+            $ip,
             FILTER_VALIDATE_IP,
             FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE
-        ) !== false;
-    }
-
-    // Resolve hostname and reject private/reserved IPv4 addresses.
-    $ip = gethostbyname($host);
-
-    if ($ip === $host) {
+        ) === false
+    ) {
         return false;
     }
 
-    return filter_var(
-        $ip,
-        FILTER_VALIDATE_IP,
-        FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE
-    ) !== false;
+    return true;
 }
 
-// -------------------------
-// 1. Validate input
-// -------------------------
-
-$url = trim((string) ($_GET['url'] ?? ''));
-
-if ($url === '') {
-    sendJsonError(400, 'Missing required parameter: url');
+// Only GET requests are supported.
+if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'GET') {
+    header('Allow: GET');
+    sendError(405, 'Only GET requests are allowed');
 }
 
-if (!isAllowedFacebookUrl($url)) {
-    sendJsonError(400, 'Please provide a valid Facebook profile URL');
+// Read and validate the Facebook profile URL.
+$profileUrl = trim((string) ($_GET['url'] ?? ''));
+
+if ($profileUrl === '' || !filter_var($profileUrl, FILTER_VALIDATE_URL)) {
+    sendError(400, 'Please provide a valid Facebook profile URL');
 }
 
-// -------------------------
-// 2. Request image URL from provider
-// -------------------------
+$profileParts = parse_url($profileUrl);
+$profileHost = strtolower($profileParts['host'] ?? '');
 
-$provider = makeRequest('https://fvdownloader.net/req', [
+$allowedHosts = [
+    'facebook.com',
+    'www.facebook.com',
+    'm.facebook.com',
+    'web.facebook.com'
+];
+
+if (
+    strtolower($profileParts['scheme'] ?? '') !== 'https' ||
+    !in_array($profileHost, $allowedHosts, true) ||
+    isset($profileParts['user']) ||
+    isset($profileParts['pass'])
+) {
+    sendError(400, 'The URL must be a valid HTTPS Facebook profile URL');
+}
+
+// Request the profile picture download information.
+$providerUrl = 'https://fvdownloader.net/req';
+
+$provider = requestUrl($providerUrl, [
     CURLOPT_POST => true,
     CURLOPT_POSTFIELDS => http_build_query([
-        'query' => $url,
+        'query' => $profileUrl,
         'downloader' => 'profile'
     ]),
-    CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
-    CURLOPT_ENCODING => 'gzip, deflate, br',
     CURLOPT_HTTPHEADER => [
-        'Accept: application/json, text/javascript, */*; q=0.01',
-        'Content-Type: application/x-www-form-urlencoded; charset=UTF-8',
+        'Accept: application/json, text/plain, */*',
+        'Accept-Encoding: identity',
+        'Content-Type: application/x-www-form-urlencoded',
         'Origin: https://fvdownloader.net',
-        'Referer: https://fvdownloader.net/facebook-profile-picture-viewer',
-        'X-Requested-With: XMLHttpRequest'
-    ]
+        'Referer: https://fvdownloader.net/',
+        'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36'
+    ],
 ]);
 
 if ($provider['error'] !== '') {
-    error_log(
-        'Facebook API provider connection error: ' .
-        $provider['error']
-    );
-
-    sendJsonError(
-        502,
-        'Could not connect to the profile picture provider. Check Vercel Runtime Logs.'
-    );
+    error_log('Facebook API provider cURL error: ' . $provider['error']);
+    sendError(502, 'Could not connect to the profile picture provider');
 }
 
-if ($provider['status'] < 200 || $provider['status'] >= 300) {
-    error_log(
-        'Facebook API provider returned HTTP ' .
-        $provider['status']
-    );
-
-    sendJsonError(502, 'Profile picture provider returned an HTTP error');
+if (
+    $provider['status'] < 200 ||
+    $provider['status'] >= 300 ||
+    !is_string($provider['body'])
+) {
+    error_log('Facebook API provider HTTP status: ' . $provider['status']);
+    sendError(502, 'The profile picture provider returned an HTTP error');
 }
 
-$data = json_decode((string) $provider['body'], true);
+$data = json_decode($provider['body'], true);
 
 if (!is_array($data)) {
     error_log('Facebook API provider returned invalid JSON');
-    sendJsonError(502, 'Provider returned an invalid response');
+    sendError(502, 'The provider returned an unexpected response');
 }
 
-$imageUrl = trim((string) ($data['downloadUrl'] ?? ''));
+$downloadUrl = $data['downloadUrl'] ?? null;
 
-if ($imageUrl === '') {
-    error_log('Facebook API provider response did not contain downloadUrl');
-    sendJsonError(404, 'Profile picture URL was not found');
+if (
+    !is_string($downloadUrl) ||
+    !isValidHttpsUrl($downloadUrl)
+) {
+    error_log('Facebook API provider returned an invalid download URL');
+    sendError(502, 'The provider did not return a valid picture URL');
 }
 
-$imageUrl = str_replace('&dl=1', '', $imageUrl);
-
-if (!isPublicHttpsUrl($imageUrl)) {
-    error_log('Facebook API provider returned an invalid image URL');
-    sendJsonError(502, 'Provider returned an invalid image URL');
-}
-
-// -------------------------
-// 3. Download image
-// -------------------------
-
-$image = makeRequest($imageUrl, [
+// Download the image bytes.
+$image = requestUrl($downloadUrl, [
     CURLOPT_HTTPHEADER => [
-        'Accept: image/avif,image/webp,image/apng,image/*,*/*;q=0.8'
+        'Accept: image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+        'Accept-Encoding: identity',
+        'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36'
     ],
-    CURLOPT_TIMEOUT => 20,
-    CURLOPT_ENCODING => 'gzip, deflate, br'
 ]);
 
 if ($image['error'] !== '') {
-    error_log('Facebook API image download error: ' . $image['error']);
-    sendJsonError(502, 'Failed to download the profile picture');
+    error_log('Facebook API image download cURL error: ' . $image['error']);
+    sendError(502, 'Could not download the profile picture');
 }
 
-if ($image['status'] !== 200 || !is_string($image['body'])) {
-    error_log(
-        'Facebook API image server returned HTTP ' .
-        $image['status']
-    );
-
-    sendJsonError(502, 'Image server returned an HTTP error');
+if (
+    $image['status'] < 200 ||
+    $image['status'] >= 300 ||
+    !is_string($image['body']) ||
+    $image['body'] === ''
+) {
+    error_log('Facebook API image download HTTP status: ' . $image['status']);
+    sendError(502, 'The profile picture could not be retrieved');
 }
 
-$bytes = $image['body'];
-
-if ($bytes === '' || strlen($bytes) > 10 * 1024 * 1024) {
-    sendJsonError(502, 'Image is empty or exceeds the 10 MB limit');
-}
-
-// Verify the actual image data.
-$imageInfo = @getimagesizefromstring($bytes);
+// Verify that the response contains image data.
+$imageInfo = @getimagesizefromstring($image['body']);
 
 if ($imageInfo === false || empty($imageInfo['mime'])) {
-    sendJsonError(502, 'The provider did not return valid image data');
+    error_log('Facebook API provider response was not a valid image');
+    sendError(502, 'The provider did not return valid image data');
 }
 
-$mime = strtolower($imageInfo['mime']);
-
-$allowedMimes = [
+$allowedImageTypes = [
     'image/jpeg',
     'image/png',
     'image/webp',
-    'image/gif',
-    'image/avif'
+    'image/gif'
 ];
 
-if (!in_array($mime, $allowedMimes, true)) {
-    sendJsonError(502, 'Unsupported image format');
+if (!in_array($imageInfo['mime'], $allowedImageTypes, true)) {
+    sendError(502, 'The provider returned an unsupported image format');
 }
 
-// -------------------------
-// 4. Return image
-// -------------------------
-
+// Return the actual image, not JSON.
 http_response_code(200);
-header('Content-Type: ' . $mime);
-header('Content-Length: ' . strlen($bytes));
-header('Cache-Control: public, max-age=3600');
+header('Content-Type: ' . $imageInfo['mime']);
+header('Content-Length: ' . strlen($image['body']));
+header('X-Content-Type-Options: nosniff');
 
-echo $bytes;
+echo $image['body'];
