@@ -1,4 +1,3 @@
-
 <?php
 // Facebook Profile Picture API
 // File: api/index.php
